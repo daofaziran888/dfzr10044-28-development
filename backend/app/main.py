@@ -9,8 +9,12 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.routers import ROUTERS
+from app.lake_seed import seed_lake_store
+from app.routers import PREFIXED_ROUTERS, ROUTERS
 from app.store import store
+
+# 启动即写入列画像所需的样本批次（幂等），保证筛选入口开箱可用。
+seed_lake_store()
 
 app = FastAPI(title="湖表工坊 · 湖表分区演化与小文件归并平台", version="1.0.0")
 
@@ -36,5 +40,7 @@ def overview() -> dict[str, object]:
 
 # 资源路由含 /api/{module}，必须放在 health / overview 之后注册，
 # 否则固定路径会被动态路径抢先匹配。
+for module in PREFIXED_ROUTERS:
+    app.include_router(module.router)
 for module in ROUTERS:
     app.include_router(module.router)

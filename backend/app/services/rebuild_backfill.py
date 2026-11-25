@@ -58,3 +58,26 @@ class RebuildBackfillService(BaseModuleService):
             wm = lake_store.get_watermark(t)
             gaps[t] = wm is None or wm.committed_value == ""
         return {"upstream_tables": upstream_tables, "gaps": gaps}
+
+    def correct_batch_rows(
+        self,
+        batch_id: str,
+        rows: list[dict[str, Any]],
+        *,
+        schema_version: str | None = None,
+        source_system: str | None = None,
+        window_start: str | None = None,
+        window_end: str | None = None,
+    ):
+        """旧版补数更正：用更正后的行替换批次内容并推进修订号。
+
+        这里只改批次数据，不直接改动待领压实计划；计划门槛的重比在路由层
+        编排（先更正、再让待领候选按当前样本重新计算）。
+        """
+        return lake_store.replace_batch_rows(
+            batch_id, rows,
+            schema_version=schema_version,
+            source_system=source_system,
+            window_start=window_start,
+            window_end=window_end,
+        )

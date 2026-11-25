@@ -6,6 +6,22 @@
         <p class="page-desc">{{ meta.desc }}</p>
       </div>
       <div class="page-actions">
+        <RouterLink
+          v-if="meta.key === 'column_stat'"
+          class="btn"
+          data-testid="open-column-profiles"
+          to="/column_stat/profiles"
+        >
+          按样本范围计算列画像
+        </RouterLink>
+        <RouterLink
+          v-if="meta.key === 'compact_job'"
+          class="btn"
+          data-testid="open-compact-candidates"
+          to="/compact_job/candidates"
+        >
+          领取压实候选
+        </RouterLink>
         <button class="btn primary" data-testid="open-create" type="button" @click="openCreate">
           登记{{ meta.entity }}
         </button>

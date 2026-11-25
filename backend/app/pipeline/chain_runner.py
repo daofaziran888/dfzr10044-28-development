@@ -428,24 +428,21 @@ def _step_stats_profile_sample(ctx: ChainContext) -> ChainContext:
 
 
 def _step_column_stat_compute(ctx: ChainContext) -> ChainContext:
-    """列统计计算：对指定列做空值比例与去重基数计算。"""
-    lk = ctx.lake_table
-    # 从批次数据获取要统计的列
-    batches = lake_store.list_batches(lk)
-    all_rows: list[dict[str, Any]] = []
-    for br in batches:
-        all_rows.extend(br.rows)
+    """列统计计算：对指定列做空值比例与去重基数计算。
 
-    # 计算 amount 列的空值比例
-    amount_values = [r.get("amount") for r in all_rows if "amount" in r]
-    null_count = sum(1 for v in amount_values if v is None or v == "")
-    total_count = len(amount_values)
+    数值区间只吸收数值取值：文本取值（如结构演进后 amount 改成文本）单独计数，
+    不参与 min/max 比较，避免跨结构版本的样本把计算打断。
+    """
+    from app.services.column_stat import ColumnStatService
+
+    lk = ctx.lake_table
+    stats = ColumnStatService().compute_column_stats(lk, "amount")
     ctx.output["column_stat"] = {
         "column": "amount",
-        "null_ratio": null_count / total_count if total_count > 0 else 0,
-        "distinct_count": len(set(amount_values)),
-        "min_value": min((v for v in amount_values if v), default=None),
-        "max_value": max((v for v in amount_values if v), default=None),
+        "null_ratio": stats["null_ratio"],
+        "distinct_count": stats["distinct_base"],
+        "min_value": stats["min_value"],
+        "max_value": stats["max_value"],
     }
     return ctx
 

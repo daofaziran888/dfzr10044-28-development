@@ -71,7 +71,12 @@ class WatermarkRecord:
 
 @dataclass
 class BatchRecord:
-    """入湖批次：一次入湖操作导出的一组数据行。"""
+    """入湖批次：一次入湖操作导出的一组数据行。
+
+    schema_version 记录该批次按哪个结构版本写入，列画像按结构版本筛选样本时
+    依赖这个归属；没有归属的旧批次保持 None，不会被误当成某个版本的数据。
+    revision 在批次被旧版补数更正时递增，列画像据此识别样本是否发生了变化。
+    """
     batch_id: str
     lake_table: str
     source_system: str
@@ -83,6 +88,69 @@ class BatchRecord:
     snapshot_id: str | None  # 落湖后分配的 snap
     status: str  # pending | ingesting | ingested | failed
     created_at: float
+    schema_version: str | None = None
+    revision: int = 0
+    updated_at: float = 0.0
+
+
+# ----------------------------- 列画像 -----------------------------
+
+@dataclass
+class ColumnProfileArtifact:
+    """列画像原件：记录统计样本清单、画像版本与可复算指纹。
+
+    原件一经生成不再改写。pinned_batches 保存采样当时的行级快照，因此即使
+    来源批次随后被旧版补数更正，已领取的压实计划仍能复算出与原件一致的画像。
+    """
+    profile_id: str
+    profile_version: str
+    lake_table: str
+    column: str
+    schema_version: str | None
+    scope: dict[str, Any]
+    sample_manifest: list[dict[str, Any]]
+    pinned_batches: list[dict[str, Any]]
+    stats: dict[str, Any]
+    fingerprint: str
+    created_at: float
+    created_by: str
+    purpose: str = "compute"
+
+
+@dataclass
+class CompactCandidate:
+    """压实候选：由列画像推导出的待领取计划，绑定画像版本与来源批次。"""
+    candidate_id: str
+    lake_table: str
+    column: str
+    partition_key: str
+    profile_id: str
+    profile_version: str
+    profile_fingerprint: str
+    sample_batch_ids: list[str]
+    sample_manifest: list[dict[str, Any]]
+    sample_scope: dict[str, Any]
+    total_rows: int
+    partition_rows: int
+    row_threshold: int
+    decision: bool
+    reason: str
+    judgement: dict[str, Any]
+    status: str  # 待领取 | 已领取 | 已失效
+    created_at: float
+    claimed_at: float | None = None
+    claimed_by: str | None = None
+    claimed_profile_id: str | None = None
+    claimed_profile_version: str | None = None
+    claimed_fingerprint: str | None = None
+    claimed_batch_ids: list[str] = field(default_factory=list)
+    claimed_batch_revisions: dict[str, int] = field(default_factory=dict)
+    claimed_sample_manifest: list[dict[str, Any]] = field(default_factory=list)
+    claim_verification: dict[str, Any] = field(default_factory=dict)
+    revalidated_at: float | None = None
+    revalidated_profile_id: str | None = None
+    revalidated_fingerprint: str | None = None
+    recompare_history: list[dict[str, Any]] = field(default_factory=list)
 
 
 # ----------------------------- 写锁 -----------------------------
@@ -141,6 +209,12 @@ class LakeStore:
 
         # 隔离区：batch_id -> list[dict]（被拦截的数据行）
         self._quarantine: dict[str, list[dict[str, Any]]] = {}
+
+        # 列画像原件：profile_id -> ColumnProfileArtifact
+        self._profiles: dict[str, ColumnProfileArtifact] = {}
+
+        # 压实候选：candidate_id -> CompactCandidate
+        self._compact_candidates: dict[str, CompactCandidate] = {}
 
         # 写锁
         self._write_lock = WriteLock()
@@ -301,6 +375,7 @@ class LakeStore:
     def store_batch(
         self, batch_id: str, lake_table: str, source_system: str,
         rows: list[dict[str, Any]], window_start: str, window_end: str,
+        schema_version: str | None = None,
     ) -> BatchRecord:
         checksum = hashlib.md5(
             str(sorted([str(r) for r in rows])).encode()
@@ -317,6 +392,9 @@ class LakeStore:
             snapshot_id=None,
             status="pending",
             created_at=time.time(),
+            schema_version=schema_version,
+            revision=0,
+            updated_at=time.time(),
         )
         self._batches[batch_id] = br
         return br
@@ -335,6 +413,88 @@ class LakeStore:
         if snapshot_id is not None:
             br.snapshot_id = snapshot_id
         return br
+
+    def replace_batch_rows(
+        self,
+        batch_id: str,
+        rows: list[dict[str, Any]],
+        *,
+        source_system: str | None = None,
+        schema_version: str | None = None,
+        window_start: str | None = None,
+        window_end: str | None = None,
+    ) -> BatchRecord | None:
+        """旧版补数更正：以更正后的行替换批次内容，并推进修订号。
+
+        修订号递增后，任何基于旧样本生成的待领压实候选都需要重新比对门槛；
+        已经领取的候选保留原画像原件，用原件里的行级快照复算。
+        """
+        br = self._batches.get(batch_id)
+        if br is None:
+            return None
+        br.rows = list(rows)
+        br.row_count = len(rows)
+        br.checksum = hashlib.md5(
+            str(sorted([str(r) for r in rows])).encode()
+        ).hexdigest()
+        if source_system is not None:
+            br.source_system = source_system
+        if schema_version is not None:
+            br.schema_version = schema_version
+        if window_start is not None:
+            br.window_start = window_start
+        if window_end is not None:
+            br.window_end = window_end
+        br.revision += 1
+        br.updated_at = time.time()
+        return br
+
+    def batch_revisions(self, batch_ids: list[str]) -> dict[str, int]:
+        """读取一批批次当前的修订号，用于判断样本是否已变化。"""
+        return {
+            batch_id: (br.revision if (br := self._batches.get(batch_id)) else -1)
+            for batch_id in batch_ids
+        }
+
+    # ---- 列画像原件 ----
+
+    def save_profile(self, artifact: ColumnProfileArtifact) -> ColumnProfileArtifact:
+        self._profiles[artifact.profile_id] = artifact
+        return artifact
+
+    def get_profile(self, profile_id: str) -> ColumnProfileArtifact | None:
+        return self._profiles.get(profile_id)
+
+    def list_profiles(
+        self, lake_table: str | None = None, column: str | None = None,
+    ) -> list[ColumnProfileArtifact]:
+        profiles = list(self._profiles.values())
+        if lake_table is not None:
+            profiles = [p for p in profiles if p.lake_table == lake_table]
+        if column is not None:
+            profiles = [p for p in profiles if p.column == column]
+        return profiles
+
+    # ---- 压实候选 ----
+
+    def save_compact_candidate(self, candidate: CompactCandidate) -> CompactCandidate:
+        self._compact_candidates[candidate.candidate_id] = candidate
+        return candidate
+
+    def get_compact_candidate(self, candidate_id: str) -> CompactCandidate | None:
+        return self._compact_candidates.get(candidate_id)
+
+    def list_compact_candidates(
+        self,
+        lake_table: str | None = None,
+        status: str | None = None,
+    ) -> list[CompactCandidate]:
+        candidates = list(self._compact_candidates.values())
+        if lake_table is not None:
+            candidates = [c for c in candidates if c.lake_table == lake_table]
+        if status is not None:
+            candidates = [c for c in candidates if c.status == status]
+        return candidates
 
     # ---- 隔离区 ----
 
